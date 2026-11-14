@@ -1,0 +1,10 @@
+[package]
+name = "theta"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.92"
+dotenv = "0.15.0"
+edgequake-llm = "0.10.10"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }

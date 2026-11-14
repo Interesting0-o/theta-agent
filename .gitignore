@@ -1,0 +1,8 @@
+/target
+
+# ide
+.nvim
+.vscode
+
+# environment
+.env
