@@ -22,7 +22,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::core::dead_letter::{DeadLetter, DeadLetterQueue};
 use crate::domain::consumer::Consumer;
-use crate::domain::event::{Event, EventError};
+use crate::domain::event::{Event, EventEnvelope, EventError};
 use crate::domain::producer::Producer;
 
 /// 事件队列的默认容量。
@@ -130,7 +130,7 @@ impl Shared {
 #[derive(Clone)]
 struct Subscriber {
     name: &'static str,
-    sender: mpsc::Sender<Arc<dyn Event>>,
+    sender: mpsc::Sender<Arc<EventEnvelope>>,
 }
 
 /// 事件分发器，同时也是可克隆的发布句柄。
@@ -138,8 +138,8 @@ struct Subscriber {
 /// 所有 clone 共享同一个事件队列、订阅表、统计和死信队列。
 #[derive(Clone)]
 pub struct Dispatcher {
-    /// 发布端：事件通过它进入有界队列。
-    tx: mpsc::Sender<Arc<dyn Event>>,
+    /// 发布端：事件信封通过它进入有界队列。
+    tx: mpsc::Sender<Arc<EventEnvelope>>,
     /// 订阅表、统计、死信等共享状态。
     shared: Arc<Shared>,
 }
@@ -204,20 +204,20 @@ impl Dispatcher {
         self
     }
 
-    /// 发布一个具体类型的事件。
+    /// 发布一个事件信封。
     ///
     /// 只保证事件成功入队，不等待消费者处理完成；需要等待时调用 [`Self::flush`]。
-    pub async fn publish<E: Event>(&self, event: E) -> Result<(), PublishError> {
-        self.publish_shared(Arc::new(event)).await
+    pub async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
+        self.publish_shared(Arc::new(envelope)).await
     }
 
-    /// 发布一个已经包在 `Arc` 中的无类型事件。
+    /// 发布一个已经包在 `Arc` 中的事件信封。
     ///
     /// 队列满时会等待，形成向生产者的背压。
-    pub async fn publish_shared(&self, event: Arc<dyn Event>) -> Result<(), PublishError> {
+    pub async fn publish_shared(&self, envelope: Arc<EventEnvelope>) -> Result<(), PublishError> {
         // 先增加 pending，避免 flush 在事件真正入队前提前返回。
         self.shared.begin_pending();
-        if self.tx.send(event).await.is_err() {
+        if self.tx.send(envelope).await.is_err() {
             self.shared.finish_pending();
             return Err(PublishError::Closed);
         }
@@ -297,8 +297,8 @@ impl Dispatcher {
     }
 }
 
-/// 后台路由任务：从事件队列取出事件，按 `TypeId` 投递给所有匹配的订阅者。
-async fn run_worker(mut rx: mpsc::Receiver<Arc<dyn Event>>, shared: Arc<Shared>) {
+/// 后台路由任务：从事件队列取出信封，按负载的 `TypeId` 投递给所有匹配的订阅者。
+async fn run_worker(mut rx: mpsc::Receiver<Arc<EventEnvelope>>, shared: Arc<Shared>) {
     while let Some(event) = rx.recv().await {
         let event_name = event.event_name();
         let event_type = event.event_type_id();
@@ -324,7 +324,7 @@ async fn run_worker(mut rx: mpsc::Receiver<Arc<dyn Event>>, shared: Arc<Shared>)
             shared.begin_pending();
             if subscriber.sender.send(Arc::clone(&event)).await.is_err() {
                 shared.dead_letter(DeadLetter {
-                    event: Arc::clone(&event),
+                    envelope: Arc::clone(&event),
                     event_name,
                     consumer: subscriber.name,
                     error: Box::new(EventError::SubscriberClosed {
@@ -358,7 +358,7 @@ fn remove_subscriber(shared: &Shared, event_type: TypeId, subscriber: &Subscribe
 /// `Shared -> 注册表 -> Sender -> 订阅任务 -> Shared` 形成引用环。
 async fn run_subscriber<E, C>(
     consumer: Arc<C>,
-    mut rx: mpsc::Receiver<Arc<dyn Event>>,
+    mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
     shared: Weak<Shared>,
 ) where
     E: Event,
@@ -367,21 +367,21 @@ async fn run_subscriber<E, C>(
     let consumer_name = consumer.name();
     let expected = std::any::type_name::<E>();
 
-    while let Some(event) = rx.recv().await {
+    while let Some(envelope) = rx.recv().await {
         // 所有 Dispatcher 句柄都释放后，worker 会退出并释放 Shared，
         // 此时订阅任务也可以结束。
         let Some(shared) = shared.upgrade() else {
             break;
         };
 
-        let event_name = event.event_name();
-        // 保留原始句柄，消费失败时放进死信。
-        let original = Arc::clone(&event);
-        let any: Arc<dyn Any + Send + Sync> = event;
+        let event_name = envelope.event_name();
+        // 信封本身保留下来，消费失败时放进死信。
+        let payload: Arc<dyn Event> = Arc::clone(&envelope.payload);
+        let any: Arc<dyn Any + Send + Sync> = payload;
 
         let Ok(event) = any.downcast::<E>() else {
             shared.dead_letter(DeadLetter {
-                event: original,
+                envelope,
                 event_name,
                 consumer: consumer_name,
                 error: Box::new(EventError::EventTypeMismatch {
@@ -396,7 +396,9 @@ async fn run_subscriber<E, C>(
         // 用独立 task 执行消费，把 panic 转成 JoinError，
         // 避免一个事件让整个订阅任务退出。
         let consumer = Arc::clone(&consumer);
-        let result = tokio::spawn(async move { consumer.consume(event).await }).await;
+        let task_envelope = Arc::clone(&envelope);
+        let result =
+            tokio::spawn(async move { consumer.consume(event, &task_envelope).await }).await;
 
         match result {
             Ok(Ok(())) => {
@@ -404,7 +406,7 @@ async fn run_subscriber<E, C>(
             }
             Ok(Err(error)) => {
                 shared.dead_letter(DeadLetter {
-                    event: original,
+                    envelope,
                     event_name,
                     consumer: consumer_name,
                     error,
@@ -412,7 +414,7 @@ async fn run_subscriber<E, C>(
             }
             Err(error) => {
                 shared.dead_letter(DeadLetter {
-                    event: original,
+                    envelope,
                     event_name,
                     consumer: consumer_name,
                     error: Box::new(error),

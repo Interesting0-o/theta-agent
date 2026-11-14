@@ -2,4 +2,5 @@
 
 pub mod consumer;
 pub mod event;
+pub mod id;
 pub mod producer;

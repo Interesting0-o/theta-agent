@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::domain::event::{BoxError, Event};
+use crate::domain::event::{BoxError, EventEnvelope};
 
 /// 一条死信记录，保存消费失败的事件及原因。
 pub struct DeadLetter {
-    /// 原始事件，保留 `Arc` 以便后续重放。
-    pub event: Arc<dyn Event>,
+    /// 原始事件信封，保留 `Arc` 以便后续重放。
+    pub envelope: Arc<EventEnvelope>,
     /// 事件类型名，便于在没有具体类型信息时展示。
     pub event_name: &'static str,
     /// 处理失败的消费者名称。

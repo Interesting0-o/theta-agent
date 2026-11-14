@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::event::{BoxError, Event};
+use super::event::{BoxError, Event, EventEnvelope};
 
 /// 事件消费者。
 ///
@@ -26,8 +26,10 @@ pub trait Consumer<E: Event>: Send + Sync + 'static {
 
     /// 处理一个事件。
     ///
-    /// 返回 `Err` 时事件会进入死信队列，不会影响其他消费者。
-    async fn consume(&self, event: Arc<E>) -> Result<(), BoxError>;
+    /// `event` 是 downcast 后的业务事件，`envelope` 保留 `event_id`、
+    /// `state_id`、`correlation_id` 等路由和因果元数据。返回 `Err` 时事件会
+    /// 进入死信队列，不会影响其他消费者。
+    async fn consume(&self, event: Arc<E>, envelope: &EventEnvelope) -> Result<(), BoxError>;
 }
 
 /// 让 `Arc<C>` 也能直接注册为消费者，便于在多个地方共享同一个实例。
@@ -37,7 +39,7 @@ impl<E: Event, C: Consumer<E> + ?Sized> Consumer<E> for Arc<C> {
         (**self).name()
     }
 
-    async fn consume(&self, event: Arc<E>) -> Result<(), BoxError> {
-        (**self).consume(event).await
+    async fn consume(&self, event: Arc<E>, envelope: &EventEnvelope) -> Result<(), BoxError> {
+        (**self).consume(event, envelope).await
     }
 }

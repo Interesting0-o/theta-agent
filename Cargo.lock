@@ -1722,6 +1722,7 @@ dependencies = [
  "dotenv",
  "edgequake-llm",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
