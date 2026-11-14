@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use theta::core::dead_letter::{DeadLetter, DeadLetterQueue};
@@ -9,6 +10,7 @@ use theta::domain::consumer::Consumer;
 use theta::domain::event::{BoxError, Event, EventEnvelope, EventScope};
 use theta::domain::id::{AgentStateId, EventId, RunId};
 use theta::domain::producer::Producer;
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 struct Ping {
@@ -47,6 +49,33 @@ struct PingFailer;
 impl Consumer<Ping> for PingFailer {
     async fn consume(&self, _event: Arc<Ping>, _envelope: &EventEnvelope) -> Result<(), BoxError> {
         Err("boom".into())
+    }
+}
+
+struct SlowConsumer {
+    blocked_once: AtomicBool,
+    release: Arc<Notify>,
+    seen: Mutex<Vec<u32>>,
+}
+
+impl SlowConsumer {
+    fn new(release: Arc<Notify>) -> Self {
+        Self {
+            blocked_once: AtomicBool::new(false),
+            release,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Consumer<Ping> for SlowConsumer {
+    async fn consume(&self, event: Arc<Ping>, _envelope: &EventEnvelope) -> Result<(), BoxError> {
+        self.seen.lock().unwrap().push(event.value);
+        if !self.blocked_once.swap(true, Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        Ok(())
     }
 }
 
@@ -155,6 +184,40 @@ async fn subscription_preserves_event_order() {
     dispatcher.flush().await;
 
     assert_eq!(*counter.values.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
+async fn slow_subscriber_does_not_block_other_subscribers() {
+    let dispatcher = Dispatcher::with_capacity(64, 1);
+    let release = Arc::new(Notify::new());
+    let slow = Arc::new(SlowConsumer::new(Arc::clone(&release)));
+    let fast = Arc::new(PingCounter::default());
+    let scope = scope();
+
+    dispatcher.subscribe(Arc::clone(&slow));
+    dispatcher.subscribe(Arc::clone(&fast));
+
+    for value in 0..5 {
+        dispatcher
+            .publish(EventEnvelope::new(scope, Ping { value }))
+            .await
+            .unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fast.count.load(Ordering::SeqCst) < 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("slow subscriber blocked the fast subscriber");
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), dispatcher.flush())
+        .await
+        .expect("flush timed out");
+
+    assert_eq!(*slow.seen.lock().unwrap(), vec![0, 1, 2, 3, 4]);
 }
 
 #[tokio::test]
@@ -269,7 +332,11 @@ async fn run_publishes_producer_events_and_waits_for_completion() {
         Arc::new(EventEnvelope::new(scope, Pong)),
         Arc::new(EventEnvelope::new(scope, Ping { value: 2 })),
     ];
-    let report = dispatcher.run(VecProducer::new(events)).await.unwrap();
+    let report = dispatcher
+        .run(VecProducer::new(events))
+        .await
+        .expect("producer task panicked")
+        .unwrap();
 
     assert_eq!(report.events, 3);
     assert_eq!(report.delivered, 2);

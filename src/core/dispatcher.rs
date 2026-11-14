@@ -6,12 +6,15 @@
 //! publish
 //!   -> 有界事件队列
 //!   -> worker 按 TypeId 路由
-//!   -> 每个订阅者各自的有界 mpsc
+//!   -> 每个订阅者的无界投递队列
+//!   -> 转发任务
+//!   -> 每个订阅者的有界通道
 //!   -> 订阅者任务串行消费
 //! ```
 //!
 //! 同一订阅者的事件保持顺序；不同订阅者之间并发处理。
-//! 队列满时 `publish` 会等待，订阅者通道满时 worker 会等待，形成背压。
+//! 主队列满时 `publish` 会等待；单个订阅者变慢只会堆积自己的投递队列，
+//! 不会阻塞 worker 向其他订阅者分发。
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -126,11 +129,30 @@ impl Shared {
     }
 }
 
+/// 发布期间的 pending 守卫。
+///
+/// 发布 future 在入队前被取消时，由 `Drop` 归还 pending，
+/// 避免 `flush` 永久等待。成功入队后置 `armed = false`，
+/// 后续 pending 由 worker 和消费者负责归还。
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    armed: bool,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.finish_pending();
+        }
+    }
+}
+
 /// 注册表中的订阅者句柄，worker 通过它把事件投递给对应的消费任务。
 #[derive(Clone)]
 struct Subscriber {
     name: &'static str,
-    sender: mpsc::Sender<Arc<EventEnvelope>>,
+    /// 无界投递队列：worker 只做同步入队，不会等待慢订阅者。
+    sender: mpsc::UnboundedSender<Arc<EventEnvelope>>,
 }
 
 /// 事件分发器，同时也是可克隆的发布句柄。
@@ -185,11 +207,14 @@ impl Dispatcher {
     {
         let name = consumer.name();
         let (tx, rx) = mpsc::channel(self.shared.subscriber_capacity);
+        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let shared = Arc::downgrade(&self.shared);
         tokio::spawn(run_subscriber::<E, C>(
             Arc::new(consumer),
             rx,
-            Arc::downgrade(&self.shared),
+            shared.clone(),
         ));
+        tokio::spawn(run_forwarder(delivery_rx, tx, shared, name));
 
         let mut subscribers = self
             .shared
@@ -199,7 +224,10 @@ impl Dispatcher {
         subscribers
             .entry(TypeId::of::<E>())
             .or_default()
-            .push(Subscriber { name, sender: tx });
+            .push(Subscriber {
+                name,
+                sender: delivery_tx,
+            });
         drop(subscribers);
         self
     }
@@ -217,10 +245,14 @@ impl Dispatcher {
     pub async fn publish_shared(&self, envelope: Arc<EventEnvelope>) -> Result<(), PublishError> {
         // 先增加 pending，避免 flush 在事件真正入队前提前返回。
         self.shared.begin_pending();
+        let mut pending = PendingGuard {
+            shared: &self.shared,
+            armed: true,
+        };
         if self.tx.send(envelope).await.is_err() {
-            self.shared.finish_pending();
             return Err(PublishError::Closed);
         }
+        pending.armed = false;
         self.shared
             .metrics
             .published
@@ -257,12 +289,30 @@ impl Dispatcher {
         &self.shared.dead_letters
     }
 
-    /// 拉取生产者事件并发布，生产结束后等待队列排空。
+    /// 在独立任务中拉取生产者事件并发布，生产结束后等待队列排空。
+    ///
+    /// 返回的 `JoinHandle` 需要 `await` 两次：外层表示任务是否 panic，
+    /// 内层是生产者结果。调用方可以继续做别的事，最后再等待 handle。
     ///
     /// 返回的统计是本次调用期间的增量，不包含调用前已经处理的事件。
-    pub async fn run<P: Producer>(&self, mut producer: P) -> Result<RunReport, EventError> {
-        // 记录调用前的累计值，最后用差值表示本次 run 的成果。
+    ///
+    /// 生产者如果是阻塞实现（例如同步读取 stdin），应在 `next` 内部使用
+    /// `tokio::task::spawn_blocking`，否则会占住 runtime 工作线程。
+    pub fn run<P>(&self, producer: P) -> tokio::task::JoinHandle<Result<RunReport, EventError>>
+    where
+        P: Producer + 'static,
+    {
+        let dispatcher = self.clone();
         let before = self.stats();
+        tokio::spawn(async move { dispatcher.drive_producer(producer, before).await })
+    }
+
+    async fn drive_producer<P: Producer>(
+        &self,
+        mut producer: P,
+        before: DispatchStats,
+    ) -> Result<RunReport, EventError> {
+        // 用调用 run 时的快照做差值，避免后台任务启动前的其他事件混入统计。
         let mut events = 0;
 
         loop {
@@ -318,11 +368,12 @@ async fn run_worker(mut rx: mpsc::Receiver<Arc<EventEnvelope>>, shared: Arc<Shar
             continue;
         }
 
-        // 逐个投递；某个订阅者通道满时，这里会等待，形成全局背压。
+        // 逐个投递；这里只做无界队列的同步入队，慢订阅者不会阻塞
+        // worker 继续处理后续事件或其他订阅者。
         for subscriber in subscribers {
-            // 每次成功投递都算一个待完成单元，由订阅者处理完后归还。
+            // 每次成功入队都算一个待完成单元，由订阅者处理完后归还。
             shared.begin_pending();
-            if subscriber.sender.send(Arc::clone(&event)).await.is_err() {
+            if subscriber.sender.send(Arc::clone(&event)).is_err() {
                 shared.dead_letter(DeadLetter {
                     envelope: Arc::clone(&event),
                     event_name,
@@ -349,6 +400,41 @@ fn remove_subscriber(shared: &Shared, event_type: TypeId, subscriber: &Subscribe
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(subscribers) = subscribers.get_mut(&event_type) {
         subscribers.retain(|candidate| !candidate.sender.same_channel(&subscriber.sender));
+    }
+}
+
+/// 单个订阅者的投递转发任务。
+///
+/// worker 只向无界投递队列同步入队，因此慢订阅者不会阻塞其他订阅者。
+/// 本任务再按顺序把事件送入有界消费通道，背压只作用在单个订阅者内部。
+async fn run_forwarder(
+    mut rx: mpsc::UnboundedReceiver<Arc<EventEnvelope>>,
+    sender: mpsc::Sender<Arc<EventEnvelope>>,
+    shared: Weak<Shared>,
+    consumer: &'static str,
+) {
+    while let Some(envelope) = rx.recv().await {
+        if let Err(error) = sender.send(envelope).await {
+            let envelope = error.0;
+            let event_name = envelope.event_name();
+            if let Some(shared) = shared.upgrade() {
+                shared.dead_letter(DeadLetter {
+                    envelope,
+                    event_name,
+                    consumer,
+                    error: Box::new(EventError::SubscriberClosed { consumer }),
+                });
+                shared.finish_pending();
+            }
+            // 消费任务已经退出，丢弃后续无法投递的事件并归还 pending，
+            // 避免 flush 永久等待。
+            while rx.recv().await.is_some() {
+                if let Some(shared) = shared.upgrade() {
+                    shared.finish_pending();
+                }
+            }
+            break;
+        }
     }
 }
 
