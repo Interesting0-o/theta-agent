@@ -4,6 +4,10 @@
 
 相关文档：[Command 系统设计](./command-system.md)、[Checkpoint 与评估设计](./checkpoint-evaluation.md)、[最小 ReAct Agent 与审核链路](./minimal-react-agent.md)。
 
+已确认的基础设施事实：[基础设施调研结论](./infrastructure-findings.md)。
+
+未确定的设计选择：[待决策清单](./open-decisions.md)。
+
 ## 1. 目标与总体思路
 
 theta 的 coding agent 需要覆盖：

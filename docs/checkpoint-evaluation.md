@@ -6,6 +6,8 @@
 
 - [Coding Agent 架构设计](./agent-architecture.md)
 - [Command 系统设计](./command-system.md)
+- [基础设施调研结论](./infrastructure-findings.md)
+- [待决策清单](./open-decisions.md)
 
 ## 1. 目标
 

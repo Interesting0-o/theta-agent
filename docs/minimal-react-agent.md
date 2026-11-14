@@ -7,6 +7,8 @@
 - [Coding Agent 架构设计](./agent-architecture.md)
 - [Checkpoint 与评估设计](./checkpoint-evaluation.md)
 - [Command 系统设计](./command-system.md)
+- [基础设施调研结论](./infrastructure-findings.md)
+- [待决策清单](./open-decisions.md)
 
 ## 1. 范围
 

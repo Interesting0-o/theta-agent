@@ -2,7 +2,7 @@
 
 状态：设计草案，尚未实现。
 
-相关文档：[Coding Agent 架构设计](./agent-architecture.md)。
+相关文档：[Coding Agent 架构设计](./agent-architecture.md)、[基础设施调研结论](./infrastructure-findings.md)、[待决策清单](./open-decisions.md)。
 
 ## 1. 背景与目标
 
