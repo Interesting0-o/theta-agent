@@ -661,7 +661,7 @@ src/core/
 6. 接入 LLM 记录/重放，接入能力工具执行器和幂等账本。
 7. 实现工具分类、执行策略、沙箱、MCP 与 skill 加载。
 8. 接入评估 runner、录制回放和指标采集。
-9. 最后再补命令系统与 CLI 交互（详见 command-system.md）。
+9. 最后再补上命令系统与 CLI 交互（详见 command-system.md）。
 
 ## 9. 待定问题
 

@@ -1721,6 +1721,8 @@ dependencies = [
  "async-trait",
  "dotenv",
  "edgequake-llm",
+ "secrecy",
+ "serde_json",
  "tokio",
  "uuid",
 ]

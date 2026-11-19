@@ -1,3 +1,75 @@
-fn main() {
-    println!("hello form theta");
+use std::io::{self, Write};
+use std::sync::Arc;
+
+use theta::core::dispatcher::Dispatcher;
+use theta::domain::agent::events::UserInput;
+use theta::domain::event::{BoxError, EventEnvelope, EventScope};
+use theta::domain::id::{AgentStateId, RunId};
+use theta::domain::producer::Producer;
+use theta::nodes::llm_node::LLMNode;
+
+struct StdinProducer {
+    scope: EventScope,
+}
+
+impl StdinProducer {
+    fn new(scope: EventScope) -> Self {
+        Self { scope }
+    }
+}
+
+#[async_trait::async_trait]
+impl Producer for StdinProducer {
+    async fn next(&mut self) -> Result<Option<Arc<EventEnvelope>>, BoxError> {
+        loop {
+            let line = tokio::task::spawn_blocking(|| -> io::Result<Option<String>> {
+                print!("> ");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                match io::stdin().read_line(&mut input)? {
+                    0 => Ok(None),
+                    _ => Ok(Some(input)),
+                }
+            })
+            .await??;
+
+            let Some(input) = line else {
+                return Ok(None);
+            };
+            let input = input.trim_end().to_string();
+            if input.is_empty() {
+                continue;
+            }
+
+            return Ok(Some(Arc::new(EventEnvelope::new(
+                self.scope,
+                UserInput { input },
+            ))));
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let dispatcher = Dispatcher::new();
+    dispatcher.subscribe::<UserInput, _>(LLMNode::new());
+
+    let scope = EventScope::new(AgentStateId::new(), RunId::new());
+    let producer = StdinProducer::new(scope);
+
+    match dispatcher.run(producer).await {
+        Ok(Ok(report)) => eprintln!(
+            "done: events={}, delivered={}, dead_lettered={}",
+            report.events, report.delivered, report.dead_lettered
+        ),
+        Ok(Err(error)) => eprintln!("event loop failed: {error}"),
+        Err(error) => eprintln!("event loop task failed: {error}"),
+    }
+
+    for letter in dispatcher.dead_letters().drain() {
+        eprintln!(
+            "dead letter: event={}, consumer={}, error={}",
+            letter.event_name, letter.consumer, letter.error
+        );
+    }
 }

@@ -21,19 +21,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
-use tokio::sync::{Notify, mpsc};
-
+use crate::config::config;
 use crate::core::dead_letter::{DeadLetter, DeadLetterQueue};
 use crate::domain::consumer::Consumer;
 use crate::domain::event::{Event, EventEnvelope, EventError};
 use crate::domain::producer::Producer;
-
-/// 事件队列的默认容量。
-const DEFAULT_QUEUE_CAPACITY: usize = 1024;
-/// 每个订阅者接收通道的默认容量。
-const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
-/// 死信队列的默认容量。
-const DEFAULT_DEAD_LETTER_CAPACITY: usize = 1024;
+use tokio::sync::{Notify, mpsc};
 
 /// 发布事件时的错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +168,10 @@ impl Default for Dispatcher {
 impl Dispatcher {
     /// 使用默认容量创建分发器，并在当前 Tokio runtime 上启动后台 worker。
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_QUEUE_CAPACITY, DEFAULT_SUBSCRIBER_CAPACITY)
+        Self::with_capacity(
+            config().main_queue_capacity,
+            config().subscriber_queue_capacity,
+        )
     }
 
     /// 自定义事件队列和每个订阅者通道的容量。
@@ -185,7 +181,7 @@ impl Dispatcher {
         let (tx, rx) = mpsc::channel(queue_capacity.max(1));
         let shared = Arc::new(Shared::new(
             subscriber_capacity.max(1),
-            DEFAULT_DEAD_LETTER_CAPACITY,
+            config().dead_letter_capacity,
         ));
         tokio::spawn(run_worker(rx, Arc::clone(&shared)));
         Self { tx, shared }
@@ -382,24 +378,22 @@ async fn run_worker(mut rx: mpsc::Receiver<Arc<EventEnvelope>>, shared: Arc<Shar
                         consumer: subscriber.name,
                     }),
                 });
-                remove_subscriber(&shared, event_type, &subscriber);
+                {
+                    let mut subscribers = shared
+                        .subscribers
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(subscribers) = subscribers.get_mut(&event_type) {
+                        subscribers
+                            .retain(|candidate| !candidate.sender.same_channel(&subscriber.sender));
+                    }
+                }
                 shared.finish_pending();
             }
         }
 
         // 事件已完成路由，结束发布时占用的 pending。
         shared.finish_pending();
-    }
-}
-
-/// 订阅任务已经退出时，从注册表移除对应句柄，避免后续事件继续产生死信。
-fn remove_subscriber(shared: &Shared, event_type: TypeId, subscriber: &Subscriber) {
-    let mut subscribers = shared
-        .subscribers
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(subscribers) = subscribers.get_mut(&event_type) {
-        subscribers.retain(|candidate| !candidate.sender.same_channel(&subscriber.sender));
     }
 }
 
