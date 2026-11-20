@@ -148,13 +148,58 @@ struct Subscriber {
     sender: mpsc::UnboundedSender<Arc<EventEnvelope>>,
 }
 
-/// 事件分发器，同时也是可克隆的发布句柄。
+/// 只暴露发布能力的事件总线句柄。
 ///
-/// 所有 clone 共享同一个事件队列、订阅表、统计和死信队列。
+/// 由 [`Dispatcher::publisher`] 创建，供需要回发事件的消费者或节点使用，
+/// 避免它们拿到订阅表、统计、死信等管理接口。所有句柄共享同一条主事件队列。
 #[derive(Clone)]
-pub struct Dispatcher {
+pub struct EventPublisher {
     /// 发布端：事件信封通过它进入有界队列。
     tx: mpsc::Sender<Arc<EventEnvelope>>,
+    /// 用于 pending 记账和 published 统计。
+    shared: Arc<Shared>,
+}
+
+impl EventPublisher {
+    /// 发布一个事件信封。
+    ///
+    /// 只保证事件成功入队，不等待消费者处理完成；需要等待时调用
+    /// [`Dispatcher::flush`]。
+    pub async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
+        self.publish_shared(Arc::new(envelope)).await
+    }
+
+    /// 发布一个已经包在 `Arc` 中的事件信封。
+    ///
+    /// 队列满时会等待，形成向生产者的背压。
+    pub async fn publish_shared(&self, envelope: Arc<EventEnvelope>) -> Result<(), PublishError> {
+        // 先增加 pending，避免 flush 在事件真正入队前提前返回。
+        self.shared.begin_pending();
+        let mut pending = PendingGuard {
+            shared: &self.shared,
+            armed: true,
+        };
+        if self.tx.send(envelope).await.is_err() {
+            return Err(PublishError::Closed);
+        }
+        pending.armed = false;
+        self.shared
+            .metrics
+            .published
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// 事件分发器。
+///
+/// 除发布外还提供订阅、统计、死信等管理能力；只需要回发事件的节点应通过
+/// [`Self::publisher`] 获取窄句柄。所有 clone 共享同一个事件队列、订阅表、
+/// 统计和死信队列。
+#[derive(Clone)]
+pub struct Dispatcher {
+    /// 发布句柄，内部持有主事件队列发送端。
+    publisher: EventPublisher,
     /// 订阅表、统计、死信等共享状态。
     shared: Arc<Shared>,
 }
@@ -184,7 +229,11 @@ impl Dispatcher {
             config().dead_letter_capacity,
         ));
         tokio::spawn(run_worker(rx, Arc::clone(&shared)));
-        Self { tx, shared }
+        let publisher = EventPublisher {
+            tx,
+            shared: Arc::clone(&shared),
+        };
+        Self { publisher, shared }
     }
 
     /// 注册一个消费者并启动其专属消费任务。
@@ -228,32 +277,26 @@ impl Dispatcher {
         self
     }
 
+    /// 获取一个只包含发布能力的事件总线句柄。
+    ///
+    /// 句柄与分发器共享同一条主事件队列；消费者可以用它回发事件，
+    /// 但无法订阅或访问统计、死信等管理接口。
+    pub fn publisher(&self) -> EventPublisher {
+        self.publisher.clone()
+    }
+
     /// 发布一个事件信封。
     ///
     /// 只保证事件成功入队，不等待消费者处理完成；需要等待时调用 [`Self::flush`]。
     pub async fn publish(&self, envelope: EventEnvelope) -> Result<(), PublishError> {
-        self.publish_shared(Arc::new(envelope)).await
+        self.publisher.publish(envelope).await
     }
 
     /// 发布一个已经包在 `Arc` 中的事件信封。
     ///
     /// 队列满时会等待，形成向生产者的背压。
     pub async fn publish_shared(&self, envelope: Arc<EventEnvelope>) -> Result<(), PublishError> {
-        // 先增加 pending，避免 flush 在事件真正入队前提前返回。
-        self.shared.begin_pending();
-        let mut pending = PendingGuard {
-            shared: &self.shared,
-            armed: true,
-        };
-        if self.tx.send(envelope).await.is_err() {
-            return Err(PublishError::Closed);
-        }
-        pending.armed = false;
-        self.shared
-            .metrics
-            .published
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.publisher.publish_shared(envelope).await
     }
 
     /// 等待所有已入队事件及其派生投递完成。

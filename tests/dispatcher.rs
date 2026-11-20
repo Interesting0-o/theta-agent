@@ -123,6 +123,26 @@ async fn pub_sub_fans_out_to_all_subscribers() {
     assert!(dispatcher.dead_letters().is_empty());
 }
 
+#[tokio::test]
+async fn publisher_handle_publishes_to_the_same_bus() {
+    let dispatcher = Dispatcher::new();
+    let counter = Arc::new(PingCounter::default());
+    dispatcher.subscribe(Arc::clone(&counter));
+
+    let publisher = dispatcher.publisher();
+    publisher
+        .publish(EventEnvelope::new(scope(), Ping { value: 9 }))
+        .await
+        .unwrap();
+    dispatcher.flush().await;
+
+    assert_eq!(counter.count.load(Ordering::SeqCst), 1);
+    assert_eq!(*counter.values.lock().unwrap(), vec![9]);
+    assert_eq!(dispatcher.stats().published, 1);
+    assert_eq!(dispatcher.stats().delivered, 1);
+    assert_eq!(dispatcher.stats().pending, 0);
+}
+
 #[derive(Default)]
 struct MultiCounter {
     pings: AtomicUsize,
