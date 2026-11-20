@@ -3,6 +3,7 @@
 # ide
 .nvim
 .vscode
+.idea
 
 # environment
 .env
