@@ -8,4 +8,5 @@ pub use async_trait::async_trait;
 mod config;
 pub mod core;
 pub mod domain;
+pub mod infrastructure;
 pub mod nodes;
