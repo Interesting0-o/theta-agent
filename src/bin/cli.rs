@@ -2,11 +2,15 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use theta::core::dispatcher::Dispatcher;
-use theta::domain::agent::events::UserInput;
+use theta::domain::agent::events::{LLMCompleted, LLMRequest, UserInput};
+use theta::domain::agent::state::AgentStateRepository;
 use theta::domain::event::{BoxError, EventEnvelope, EventScope};
 use theta::domain::id::{AgentStateId, RunId};
 use theta::domain::producer::Producer;
+use theta::infrastructure::in_memory_repo::InMemoryRepository;
+use theta::nodes::agent_actor::AgentActor;
 use theta::nodes::llm_node::LLMNode;
+use theta::nodes::print_worker::PrintWorker;
 
 struct StdinProducer {
     scope: EventScope,
@@ -52,7 +56,10 @@ impl Producer for StdinProducer {
 #[tokio::main]
 async fn main() {
     let dispatcher = Dispatcher::new();
-    dispatcher.subscribe::<UserInput, _>(LLMNode::new());
+    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
+    dispatcher.subscribe::<UserInput, _>(AgentActor::new(repo, dispatcher.publisher()));
+    dispatcher.subscribe::<LLMRequest, _>(LLMNode::new(dispatcher.publisher()));
+    dispatcher.subscribe::<LLMCompleted, _>(PrintWorker::new());
 
     let scope = EventScope::new(AgentStateId::new(), RunId::new());
     let producer = StdinProducer::new(scope);
