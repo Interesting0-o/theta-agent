@@ -338,6 +338,34 @@ McpManager
 
 【设计约束】不要把 `target/`、`.git/` 等目录纳入 workspace 快照；必须先定义 include/exclude 规则。
 
+### 4.5 可复用的 checkpoint 实现调研（2026-11-19）【外部核实】
+
+先区分同名包：
+
+- PyPI 上的 `langgraph-checkpoint`、`langgraph-checkpoint-sqlite`、`langgraph-checkpoint-postgres` 是 LangChain 官方的 **Python** 包，Rust 不能直接使用。
+- crates.io 上也有同名 `langgraph-checkpoint` / `langgraph-checkpoint-sqlite` / `langgraph-checkpoint-postgres` 0.1.0，但它们是社区 Rust 移植（仓库 `CYXCAT/langgraph-rust`），和官方 Python 包没有关系。
+- crates.io 还有 `langgraph` 0.2.5（`Onelevenvy/langgraph-rust`）和 `rust-langgraph` 0.1.1（`kareem2002-k/rust-langgraph`），同样是独立社区项目，不是 LangChain 官方实现。
+
+Rust 生态现状：
+
+| 方案 | 版本 | 能提供 | 局限 |
+|---|---|---|---|
+| `langgraph-checkpoint` + sqlite/postgres | 0.1.0 | 同步 `CheckpointSaver`；`Checkpoint{thread_id, checkpoint_id, state, pending_writes}`；InMemory / SQLite / Postgres | 极新；绑定 `langgraph_core::StatePatch`；无 parent/fork、workspace、artifact、事件 hash；SQLite schema 只有 `thread_id/checkpoint_id/payload/created_at` |
+| `rust-langgraph` | 0.1.1 | 异步 `BaseCheckpointSaver`、`CheckpointTuple`、`MemorySaver` | SQLite/Postgres 后端仍是 stub；绑定其 graph/Pregel 模型 |
+| `agentplane` | 0.61.0 | durable journal、strict replay、redb/Postgres、hash chain | pre-alpha；完整 runtime；其 Checkpoint 是 Merkle 透明日志检查点，不是 AgentState 快照；采用它等于替换现有 Dispatcher/AgentActor |
+| `yoagent-state` | 0.5.3 | `EventStore` + `SnapshotStore` + `ForkStore` + `ArtifactStore`、JSONL/git 持久化、lineage/fork | 领域模型是 goal/task/patch/eval 图，不是通用 AgentState；trait 拆分可借鉴 |
+| `durare` / `dbos` | 0.5.0 / 0.6.0 | DBOS 风格 step checkpoint、崩溃恢复、durable timer/queue；SQLite/Postgres | 解决工作流 step 重放，不是 AgentState/workspace 快照；与事件驱动 Actor 模型耦合成本高 |
+| `eventastic` / `esrs` / `eventually` | 0.5.0 / 0.18.0 / 0.4.0 | 事件溯源、aggregate、事务、幂等、部分 snapshot | 面向 CQRS/aggregate，不具备 agent checkpoint、workspace、审批语义 |
+| `aion-store` | 0.31.0 | durable workflow 的事件存储契约 | AGPL-3.0-only，许可不适合当前项目 |
+| Restate / Temporal | `restate-sdk` 0.13.0 / `temporal-sdk-core` alpha | 通用 durable execution | 需要服务端或确定性工作流模型，第一版过重 |
+
+结论：
+
+- **没有可直接采用的完整实现**；第一版仍按 [`checkpoint-evaluation.md`](./checkpoint-evaluation.md) 的 `CheckpointStore` / `WorkspaceSnapshotter` 自行实现，先做内存实现，再按 5.1 的选型接 SQLite。
+- 可借鉴 `langgraph-checkpoint` 的 `thread_id/checkpoint_id/parent_id/pending_writes` 字段设计，以及 `yoagent-state` 的 `EventStore/SnapshotStore/ForkStore/ArtifactStore` 拆分。
+- 不直接依赖 graph 框架或完整 agent runtime；它们会替换现有事件模型，且版本过新。
+- `AgentState` 需要补 `serde` derive；`ChatMessage` 已实现 `Serialize/Deserialize`。事件链与 artifact hash 可用 `blake3`。
+
 ---
 
 ## 5. 数据库持久化与事务
@@ -581,6 +609,23 @@ SELECT ... FROM event_outbox WHERE published_at_ms IS NULL ORDER BY rowid LIMIT 
 - https://github.com/aaif-goose/goose/blob/2365bc5e898a/crates/goose/src/agents/tool_schema_normalize.rs
 - https://github.com/zed-industries/zed/blob/f0fa51bb510f/crates/agent/src/thread.rs
 - https://github.com/zed-industries/zed/blob/f0fa51bb510f/crates/agent/src/tool_permissions.rs
+
+**Checkpoint 实现**
+
+- https://pypi.org/project/langgraph-checkpoint/
+- https://pypi.org/project/langgraph-checkpoint-sqlite/
+- https://pypi.org/project/langgraph-checkpoint-postgres/
+- https://github.com/CYXCAT/langgraph-rust
+- https://github.com/Onelevenvy/langgraph-rust
+- https://github.com/kareem2002-k/rust-langgraph
+- https://github.com/hupe1980/agentplane
+- https://github.com/yologdev/yoagent-state
+- https://github.com/SamuelXing/durare
+- https://github.com/dbos-inc/dbos-transact-rust
+- https://github.com/primait/event_sourcing.rs
+- https://github.com/jdon/eventastic
+- https://github.com/ablative-io/aion
+- https://github.com/restatedev/sdk-rust
 
 **SQLite / sqlx / rusqlite**
 
