@@ -60,3 +60,26 @@ impl Event for LLMCompleted {
         "theta.agent.llm_completed.v1"
     }
 }
+
+/// 请求工具节点执行模型给出的工具调用。
+///
+/// 由 `AgentActor` 在持久化包含 `tool_calls` 的 assistant 消息之后发布，
+/// 保证工具结果回到状态时对应的调用已经落库。
+pub struct ToolCallRequest {
+    /// 本次需要执行的工具调用。
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl Event for ToolCallRequest {
+    fn event_name(&self) -> &'static str {
+        "theta.agent.tool_call_requested.v1"
+    }
+}
+
+/// 工具调用的集中执行结果。
+pub struct ToolCallResponse {
+    /// 集中tool call执行结果
+    pub tool_res: Vec<ChatMessage>,
+}
+
+impl Event for ToolCallResponse {}
