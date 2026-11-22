@@ -5,15 +5,14 @@ use theta::core::dispatcher::Dispatcher;
 use theta::domain::agent::events::{
     LLMCompleted, LLMRequest, ToolCallRequest, ToolCallResponse, UserInput,
 };
-use theta::domain::agent::state::AgentStateRepository;
 use theta::domain::event::{BoxError, EventEnvelope, EventScope};
 use theta::domain::id::{AgentStateId, RunId};
 use theta::domain::producer::Producer;
-use theta::infrastructure::in_memory_repo::InMemoryRepository;
 use theta::nodes::agent_actor::AgentActor;
 use theta::nodes::llm_node::LLMNode;
 use theta::nodes::print_worker::PrintWorker;
 use theta::nodes::tool_node::ToolNode;
+use theta::service::mailbox::AgentMailbox;
 
 struct StdinProducer {
     scope: EventScope,
@@ -59,8 +58,8 @@ impl Producer for StdinProducer {
 #[tokio::main]
 async fn main() {
     let dispatcher = Dispatcher::new();
-    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
-    let actor = Arc::new(AgentActor::new(repo, dispatcher.publisher()));
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
+    let actor = Arc::new(AgentActor::new(mailbox));
     dispatcher.subscribe::<UserInput, _>(Arc::clone(&actor));
     dispatcher.subscribe::<LLMCompleted, _>(Arc::clone(&actor));
     dispatcher.subscribe::<ToolCallResponse, _>(Arc::clone(&actor));

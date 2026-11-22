@@ -61,8 +61,8 @@ impl std::error::Error for AgentStateError {
 
 /// `AgentState` 的持久化仓储。
 ///
-/// 只应由 `AgentActor` 调用写方法；其他节点通过事件影响状态，
-/// 不能直接修改仓储中的数据。
+/// 只应由 `AgentMailbox` 的消费任务调用写方法；上层节点通过 mailbox
+/// 提交状态变更，不能直接修改仓储中的数据。
 #[async_trait]
 pub trait AgentStateRepository: Send + Sync + 'static {
     /// 创建新状态；标识已存在时返回 [`AgentStateError::AlreadyExists`]。

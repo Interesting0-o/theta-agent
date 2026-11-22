@@ -2,24 +2,35 @@ use std::sync::Arc;
 
 use edgequake_llm::ChatMessage;
 
-use crate::core::dispatcher::EventPublisher;
 use crate::domain::agent::events::{
     LLMCompleted, LLMRequest, ToolCallRequest, ToolCallResponse, UserInput,
 };
-use crate::domain::agent::state::{AgentState, AgentStateRepository};
+use crate::domain::agent::state::AgentState;
 use crate::domain::consumer::Consumer;
 use crate::domain::event::{BoxError, EventEnvelope};
+use crate::service::mailbox::{AgentMailbox, AgentMailboxError, StateTransition};
 
-/// 单写者的 agent 状态机，负责读写状态并驱动下游节点。
+/// Agent 状态机与上下文组装点。
+///
+/// 状态读写通过 [`AgentMailbox`] 串行提交，这里只负责决定状态如何变化，
+/// 以及如何把状态组装成发给模型的上下文。
 pub struct AgentActor {
-    repo: Arc<dyn AgentStateRepository>,
-    publisher: EventPublisher,
+    mailbox: AgentMailbox,
 }
 
 impl AgentActor {
-    /// 注入状态仓储和只含发布能力的事件总线句柄。
-    pub fn new(repo: Arc<dyn AgentStateRepository>, publisher: EventPublisher) -> Self {
-        Self { repo, publisher }
+    /// 注入用于提交状态变更的 mailbox 句柄。
+    pub fn new(mailbox: AgentMailbox) -> Self {
+        Self { mailbox }
+    }
+
+    /// 组装本次发给模型的上下文。
+    ///
+    /// 当前直接使用完整消息历史；后续的 token 裁剪、摘要和检索注入都在这里接入。
+    fn build_llm_request(state: &AgentState) -> LLMRequest {
+        LLMRequest {
+            messages: state.messages.clone(),
+        }
     }
 }
 
@@ -31,25 +42,18 @@ impl Consumer<UserInput> for AgentActor {
         envelope: &EventEnvelope,
     ) -> Result<(), BoxError> {
         let state_id = envelope.scope.state_id;
-        let existing = self.repo.get(state_id).await?;
-        let mut state = match &existing {
-            Some(state) => (**state).clone(),
-            None => AgentState::new(state_id),
-        };
-        state.messages.push(ChatMessage::user(event.input.clone()));
+        let envelope = Arc::new(envelope.clone());
+        self.mailbox
+            .execute(state_id, move |current| {
+                let mut state = current
+                    .cloned()
+                    .unwrap_or_else(|| AgentState::new(state_id));
+                state.messages.push(ChatMessage::user(event.input.clone()));
 
-        let state = Arc::new(state);
-        if existing.is_some() {
-            self.repo.update(Arc::clone(&state)).await?;
-        } else {
-            self.repo.create(Arc::clone(&state)).await?;
-        }
-
-        let request = envelope.reply(LLMRequest {
-            messages: state.messages.clone(),
-        });
-        self.publisher.publish(request).await?;
-        Ok(())
+                let request = envelope.reply(Self::build_llm_request(&state));
+                Ok(StateTransition::new(state).with_effect(request))
+            })
+            .await
     }
 }
 
@@ -61,31 +65,34 @@ impl Consumer<LLMCompleted> for AgentActor {
         envelope: &EventEnvelope,
     ) -> Result<(), BoxError> {
         let state_id = envelope.scope.state_id;
-        if let Some(agent_state) = self.repo.get(state_id).await? {
-            // 拿到Agent实体
-            let mut agent_state = (*agent_state).clone();
-            let tool_calls = event.tool_calls.clone();
+        let envelope = Arc::new(envelope.clone());
+        self.mailbox
+            .execute(state_id, move |current| {
+                let Some(current) = current else {
+                    return Err(AgentMailboxError::MissingState(state_id).into());
+                };
 
-            if tool_calls.is_empty() {
-                agent_state
-                    .messages
-                    .push(ChatMessage::assistant(event.content.clone()));
-            } else {
-                agent_state.messages.push(ChatMessage::assistant_with_tools(
-                    event.content.clone(),
-                    tool_calls.clone(),
-                ));
-            }
-            let agent_state = Arc::new(agent_state);
-            self.repo.update(Arc::clone(&agent_state)).await?;
+                let mut state = current.clone();
+                let tool_calls = event.tool_calls.clone();
+                if tool_calls.is_empty() {
+                    state
+                        .messages
+                        .push(ChatMessage::assistant(event.content.clone()));
+                } else {
+                    state.messages.push(ChatMessage::assistant_with_tools(
+                        event.content.clone(),
+                        tool_calls.clone(),
+                    ));
+                }
 
-            // 先落库再请求工具，保证结果返回时 assistant 消息已经存在。
-            if !tool_calls.is_empty() {
-                let request = envelope.reply(ToolCallRequest { tool_calls });
-                self.publisher.publish(request).await?;
-            }
-        }
-        Ok(())
+                let mut transition = StateTransition::new(state);
+                if !tool_calls.is_empty() {
+                    transition =
+                        transition.with_effect(envelope.reply(ToolCallRequest { tool_calls }));
+                }
+                Ok(transition)
+            })
+            .await
     }
 }
 
@@ -97,23 +104,19 @@ impl Consumer<ToolCallResponse> for AgentActor {
         envelope: &EventEnvelope,
     ) -> Result<(), BoxError> {
         let state_id = envelope.scope.state_id;
-        if let Some(state) = self.repo.get(state_id).await? {
-            // 拿到agent状态实体
-            let mut agent_state = (*state).clone();
+        let envelope = Arc::new(envelope.clone());
+        self.mailbox
+            .execute(state_id, move |current| {
+                let Some(current) = current else {
+                    return Err(AgentMailboxError::MissingState(state_id).into());
+                };
 
-            // 将tool call返回拼接会状态
-            agent_state.messages.extend(event.tool_res.iter().cloned());
+                let mut state = current.clone();
+                state.messages.extend(event.tool_res.iter().cloned());
 
-            // 更新状态
-            let agent_state = Arc::new(agent_state);
-            self.repo.update(Arc::clone(&agent_state)).await?;
-
-            // 构建请求并发布
-            let request = envelope.reply(LLMRequest {
-                messages: agent_state.messages.clone(),
-            });
-            self.publisher.publish(request).await?;
-        }
-        Ok(())
+                let request = envelope.reply(Self::build_llm_request(&state));
+                Ok(StateTransition::new(state).with_effect(request))
+            })
+            .await
     }
 }
