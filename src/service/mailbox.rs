@@ -203,7 +203,6 @@ impl AgentMailbox {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sender) = mailboxes.get(&state_id) {
-
             // 如果找到会话的通道直接使用
             return sender.clone();
         }
@@ -243,7 +242,7 @@ async fn apply_command(
     publisher: &EventPublisher,
 ) -> Result<(), BoxError> {
     let current = repo.get(state_id).await?;
-    
+
     let transition = operation(current.as_deref())?;
 
     if transition.state.state_id != state_id {
