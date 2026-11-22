@@ -12,6 +12,8 @@ pub struct Config {
     pub main_queue_capacity: usize,
     /// 每个订阅者接收通道的容量。
     pub subscriber_queue_capacity: usize,
+    /// 每个 AgentState mailbox 的队列容量。
+    pub mailbox_queue_capacity: usize,
     /// 死信队列容量。
     pub dead_letter_capacity: usize,
     /// 对话模型名称，对应 `CHAT_MODEL_NAME`。
@@ -43,6 +45,7 @@ fn load_config() -> Config {
         version: "0.0.1".to_string(),
         main_queue_capacity: capacity(1024),
         subscriber_queue_capacity: capacity(1024),
+        mailbox_queue_capacity: capacity(64),
         dead_letter_capacity: capacity(1024),
         chat_model_name: env_string("CHAT_MODEL_NAME"),
         chat_model_api_key: SecretString::from(env_string("CHAT_MODEL_API_KEY")),
