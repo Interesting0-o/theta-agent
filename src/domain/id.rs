@@ -61,3 +61,64 @@ uuid_id! {
     /// 一次执行尝试的标识；同一个 `AgentState` 可以有多次 run。
     RunId
 }
+
+/// 模型返回的工具调用标识，用于把工具请求与结果配对。
+///
+/// 与 [`EventId`] 等本地标识不同，这个值由 provider 生成（例如
+/// `call_abc123`），必须原样保留并回传给模型，不能重新生成。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ToolCallId(String);
+
+impl ToolCallId {
+    /// 用 provider 返回的原始标识创建。
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// 为本地发起的工具调用生成新标识。
+    ///
+    /// provider 返回的调用必须用 [`Self::new`] 保留原值；重放历史时不能重新生成。
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// 返回原始标识。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// 取出内部字符串。
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for ToolCallId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for ToolCallId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ToolCallId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<ToolCallId> for String {
+    fn from(value: ToolCallId) -> Self {
+        value.0
+    }
+}
+
+impl AsRef<str> for ToolCallId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
