@@ -7,13 +7,12 @@ use theta::core::dispatcher::{Dispatcher, EventPublisher};
 use theta::domain::agent::events::{
     LLMCompleted, LLMRequest, TokenUsage, ToolCallRequest, ToolCallResponse, UserInput,
 };
-use theta::domain::agent::state::{AgentState, AgentStateRepository};
 use theta::domain::consumer::Consumer;
 use theta::domain::event::{BoxError, EventEnvelope, EventScope};
 use theta::domain::id::{AgentStateId, RunId};
-use theta::infrastructure::in_memory_repo::InMemoryRepository;
 use theta::nodes::agent_actor::AgentActor;
 use theta::nodes::tool_node::ToolNode;
+use theta::service::mailbox::AgentMailbox;
 
 fn sample_tool_call(id: &str) -> ToolCall {
     ToolCall {
@@ -99,12 +98,11 @@ impl Consumer<LLMRequest> for RequestRecorder {
 #[tokio::test]
 async fn user_input_updates_state_and_publishes_llm_request() {
     let dispatcher = Dispatcher::new();
-    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
     let recorder = Arc::new(RequestRecorder::default());
 
     dispatcher.subscribe::<LLMRequest, _>(Arc::clone(&recorder));
-    dispatcher
-        .subscribe::<UserInput, _>(AgentActor::new(Arc::clone(&repo), dispatcher.publisher()));
+    dispatcher.subscribe::<UserInput, _>(AgentActor::new(mailbox.clone()));
 
     let scope = EventScope::new(AgentStateId::new(), RunId::new());
     let input = EventEnvelope::new(
@@ -118,8 +116,8 @@ async fn user_input_updates_state_and_publishes_llm_request() {
     dispatcher.publish(input).await.unwrap();
     dispatcher.flush().await;
 
-    let state = repo
-        .get(scope.state_id)
+    let state = mailbox
+        .state(scope.state_id)
         .await
         .unwrap()
         .expect("state saved");
@@ -135,12 +133,11 @@ async fn user_input_updates_state_and_publishes_llm_request() {
 #[tokio::test]
 async fn second_input_appends_to_existing_state() {
     let dispatcher = Dispatcher::new();
-    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
     let recorder = Arc::new(RequestRecorder::default());
 
     dispatcher.subscribe::<LLMRequest, _>(Arc::clone(&recorder));
-    dispatcher
-        .subscribe::<UserInput, _>(AgentActor::new(Arc::clone(&repo), dispatcher.publisher()));
+    dispatcher.subscribe::<UserInput, _>(AgentActor::new(mailbox.clone()));
 
     let scope = EventScope::new(AgentStateId::new(), RunId::new());
     for input in ["first", "second"] {
@@ -156,8 +153,8 @@ async fn second_input_appends_to_existing_state() {
     }
     dispatcher.flush().await;
 
-    let state = repo
-        .get(scope.state_id)
+    let state = mailbox
+        .state(scope.state_id)
         .await
         .unwrap()
         .expect("state saved");
@@ -168,17 +165,14 @@ async fn second_input_appends_to_existing_state() {
 #[tokio::test]
 async fn llm_completed_with_tool_calls_persists_assistant_then_publishes_request() {
     let dispatcher = Dispatcher::new();
-    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
     let recorder = Arc::new(ToolRequestRecorder::default());
     let scope = EventScope::new(AgentStateId::new(), RunId::new());
 
-    repo.create(Arc::new(AgentState::new(scope.state_id)))
-        .await
-        .unwrap();
+    mailbox.create_state(scope.state_id).await.unwrap();
 
     dispatcher.subscribe::<ToolCallRequest, _>(Arc::clone(&recorder));
-    dispatcher
-        .subscribe::<LLMCompleted, _>(AgentActor::new(Arc::clone(&repo), dispatcher.publisher()));
+    dispatcher.subscribe::<LLMCompleted, _>(AgentActor::new(mailbox.clone()));
 
     dispatcher
         .publish(EventEnvelope::new(
@@ -195,8 +189,8 @@ async fn llm_completed_with_tool_calls_persists_assistant_then_publishes_request
         .unwrap();
     dispatcher.flush().await;
 
-    let state = repo
-        .get(scope.state_id)
+    let state = mailbox
+        .state(scope.state_id)
         .await
         .unwrap()
         .expect("state saved");
@@ -215,9 +209,9 @@ async fn llm_completed_with_tool_calls_persists_assistant_then_publishes_request
 #[tokio::test]
 async fn tool_call_loop_appends_results_before_next_llm_request() {
     let dispatcher = Dispatcher::new();
-    let repo: Arc<dyn AgentStateRepository> = Arc::new(InMemoryRepository::new());
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
     let scope = EventScope::new(AgentStateId::new(), RunId::new());
-    let actor = Arc::new(AgentActor::new(Arc::clone(&repo), dispatcher.publisher()));
+    let actor = Arc::new(AgentActor::new(mailbox.clone()));
     let llm = Arc::new(ScriptedLlm {
         publisher: dispatcher.publisher(),
         calls: AtomicUsize::new(0),
@@ -242,8 +236,8 @@ async fn tool_call_loop_appends_results_before_next_llm_request() {
 
     assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
 
-    let state = repo
-        .get(scope.state_id)
+    let state = mailbox
+        .state(scope.state_id)
         .await
         .unwrap()
         .expect("state saved");
@@ -267,4 +261,58 @@ async fn tool_call_loop_appends_results_before_next_llm_request() {
         "tool result must follow the assistant tool call"
     );
     assert_eq!(state.messages[3].content, "done");
+}
+
+#[tokio::test]
+async fn concurrent_agent_events_are_serialized_by_mailbox() {
+    let dispatcher = Dispatcher::new();
+    let mailbox = AgentMailbox::in_memory(dispatcher.publisher());
+    let scope = EventScope::new(AgentStateId::new(), RunId::new());
+    let actor = Arc::new(AgentActor::new(mailbox.clone()));
+
+    dispatcher.subscribe::<UserInput, _>(Arc::clone(&actor));
+    dispatcher.subscribe::<LLMCompleted, _>(Arc::clone(&actor));
+
+    mailbox.create_state(scope.state_id).await.unwrap();
+
+    let input = EventEnvelope::new(
+        scope,
+        UserInput {
+            input: "hello".to_string(),
+        },
+    );
+    let completed = EventEnvelope::new(
+        scope,
+        LLMCompleted {
+            content: "reply".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_string()),
+            model: "test".to_string(),
+            usage: TokenUsage::default(),
+        },
+    );
+
+    let (input, completed) = tokio::join!(dispatcher.publish(input), dispatcher.publish(completed));
+    input.unwrap();
+    completed.unwrap();
+    dispatcher.flush().await;
+
+    let state = mailbox
+        .state(scope.state_id)
+        .await
+        .unwrap()
+        .expect("state saved");
+    assert_eq!(state.messages.len(), 2);
+    assert!(
+        state
+            .messages
+            .iter()
+            .any(|message| message.role == ChatRole::User)
+    );
+    assert!(
+        state
+            .messages
+            .iter()
+            .any(|message| message.role == ChatRole::Assistant)
+    );
 }
