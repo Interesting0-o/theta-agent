@@ -8,8 +8,8 @@
 
 - **事件信封**：业务事件外统一携带 `state_id`、`run_id`、`event_id`、`correlation_id`、`causation_id`、`sequence` 和时间戳。
 - **异步事件总线**：按事件 `TypeId` 路由；每个订阅者独立队列，慢消费者只背压自己；支持 `flush`、运行统计和有界死信队列。
-- **状态仓储**：`AgentStateRepository` 提供异步 `create/get/update/delete`，内置线程安全的内存实现。
-- **单写者 AgentActor**：按事件信封中的 `state_id` 读写状态，组装上下文并驱动下游节点。
+- **状态服务 mailbox**：`AgentMailbox` 封装 `AgentStateRepository`，按 `state_id` 串行执行状态变更，节点不直接操作仓储。
+- **单写者 AgentActor**：负责状态机与上下文组装，通过 mailbox 提交状态变更并驱动下游节点。
 - **无状态 LLMNode**：只消费 `LLMRequest`、调用模型并发布 `LLMCompleted`，不保存会话历史。
 - **可拆分的输出节点**：`PrintWorker` 作为 `LLMCompleted` 的独立消费者负责终端输出。
 
@@ -18,14 +18,14 @@
 ```text
 Stdin
   -> UserInput
-  -> AgentActor          # 加载/更新 AgentState，追加用户消息
+  -> AgentActor          # 通过 mailbox 串行更新 AgentState，组装上下文
   -> LLMRequest
   -> LLMNode             # 调用 OpenAI-compatible provider
   -> LLMCompleted
   -> PrintWorker         # 输出到终端
 ```
 
-事件总线只传递“发生了什么”；`AgentState` 只由 AgentActor 写入。
+事件总线只传递“发生了什么”；`AgentState` 只由 AgentActor 通过 mailbox 写入。
 
 ## 快速开始
 
@@ -59,11 +59,12 @@ cargo clippy --all-targets
 src/
   domain/            # 事件、信封、ID、消费者/生产者、Agent 状态与事件
   core/              # Dispatcher、EventPublisher、死信队列
+  service/           # AgentMailbox：封装仓储，按 state_id 串行化状态写入
   nodes/             # AgentActor、LLMNode、PrintWorker
-  infrastructure/    # 状态仓储实现（当前为内存版）
+  infrastructure/    # 内部状态仓储实现，仅 service 使用
   bin/cli.rs         # CLI 入口
 docs/                # 架构、ReAct、checkpoint、基础设施调研
-tests/               # 总线路由、仓储、Actor、LLM 节点集成测试
+tests/               # 总线路由、mailbox、Actor、LLM 节点集成测试
 ```
 
 ## 设计文档
